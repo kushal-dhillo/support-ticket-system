@@ -1,0 +1,353 @@
+import java.util.*;
+import java.util.function.*;
+import java.util.stream.*;
+
+/**
+ * Support Ticket Management System
+ * --------------------------------
+ * Business problem : track, assign, escalate and report on customer support tickets.
+ * Concepts shown   : OOP (abstraction, inheritance, polymorphism, encapsulation),
+ *                    enums with behaviour, custom exceptions, interfaces (repository
+ *                    pattern), collections, streams, Comparator sorting, and a small
+ *                    built-in unit-test runner (no JUnit needed for online compilers).
+ *
+ * Runs on any Java 11+ online compiler. Keep the file name Main.java.
+ */
+public class Main {
+
+    // ======================= ENUMS =======================
+
+    enum Priority {
+        LOW(72), MEDIUM(48), HIGH(24), CRITICAL(4);
+
+        private final int slaHours;
+        Priority(int slaHours) { this.slaHours = slaHours; }
+        public int getSlaHours() { return slaHours; }
+
+        public Priority escalate() {
+            return this == CRITICAL ? CRITICAL : values()[ordinal() + 1];
+        }
+    }
+
+    enum Status {
+        OPEN, IN_PROGRESS, RESOLVED, CLOSED;
+
+        public boolean canMoveTo(Status next) {
+            switch (this) {
+                case OPEN:        return next == IN_PROGRESS;
+                case IN_PROGRESS: return next == RESOLVED || next == OPEN;
+                case RESOLVED:    return next == CLOSED || next == IN_PROGRESS; // reopen
+                default:          return false; // CLOSED is final
+            }
+        }
+    }
+
+    // ======================= EXCEPTIONS =======================
+
+    static class TicketNotFoundException extends RuntimeException {
+        TicketNotFoundException(int id) { super("Ticket #" + id + " not found"); }
+    }
+
+    static class InvalidTransitionException extends RuntimeException {
+        InvalidTransitionException(Status from, Status to) {
+            super("Cannot move ticket from " + from + " to " + to);
+        }
+    }
+
+    // ======================= DOMAIN MODEL =======================
+
+    /** Abstract base class: shared state and behaviour for every ticket type. */
+    static abstract class Ticket {
+        private final int id;
+        private final String title;
+        private Priority priority;
+        private Status status = Status.OPEN;
+        private String assignee = "Unassigned";
+        private final int createdAtHour;                 // simulated clock (hours)
+        private final List<String> history = new ArrayList<>();
+
+        protected Ticket(int id, String title, Priority priority, int createdAtHour) {
+            this.id = id;
+            this.title = title;
+            this.priority = priority;
+            this.createdAtHour = createdAtHour;
+            log("Created with priority " + priority);
+        }
+
+        /** Each ticket type decides its own category label (polymorphism). */
+        public abstract String category();
+
+        /** Each ticket type can adjust the SLA (polymorphism). */
+        public int slaHours() { return priority.getSlaHours(); }
+
+        public boolean isOverdue(int nowHour) {
+            return status != Status.RESOLVED && status != Status.CLOSED
+                    && (nowHour - createdAtHour) > slaHours();
+        }
+
+        void changeStatus(Status next) {
+            if (!status.canMoveTo(next)) throw new InvalidTransitionException(status, next);
+            log("Status " + status + " -> " + next);
+            status = next;
+        }
+
+        void assignTo(String agent) { log("Assigned to " + agent); assignee = agent; }
+
+        void escalate() {
+            Priority old = priority;
+            priority = priority.escalate();
+            if (old != priority) log("Escalated " + old + " -> " + priority);
+        }
+
+        void log(String message) { history.add(message); }
+
+        public int getId() { return id; }
+        public String getTitle() { return title; }
+        public Priority getPriority() { return priority; }
+        public Status getStatus() { return status; }
+        public String getAssignee() { return assignee; }
+        public int getCreatedAtHour() { return createdAtHour; }
+        public List<String> getHistory() { return Collections.unmodifiableList(history); }
+
+        @Override
+        public String toString() {
+            return String.format("#%-3d [%-8s] %-14s %-11s %-10s %s",
+                    id, priority, category(), status, assignee, title);
+        }
+    }
+
+    static class BugTicket extends Ticket {
+        BugTicket(int id, String title, Priority p, int hour) { super(id, title, p, hour); }
+        @Override public String category() { return "Bug"; }
+        @Override public int slaHours() { return Math.max(1, super.slaHours() - 2); } // bugs are stricter
+    }
+
+    static class FeatureRequest extends Ticket {
+        FeatureRequest(int id, String title, Priority p, int hour) { super(id, title, p, hour); }
+        @Override public String category() { return "Feature"; }
+        @Override public int slaHours() { return super.slaHours() * 2; } // features are more relaxed
+    }
+
+    static class AccessRequest extends Ticket {
+        AccessRequest(int id, String title, Priority p, int hour) { super(id, title, p, hour); }
+        @Override public String category() { return "Access"; }
+    }
+
+    // ======================= REPOSITORY (interface + implementation) =======================
+
+    interface TicketRepository {
+        void save(Ticket ticket);
+        Optional<Ticket> findById(int id);
+        List<Ticket> findAll();
+    }
+
+    static class InMemoryTicketRepository implements TicketRepository {
+        private final Map<Integer, Ticket> store = new LinkedHashMap<>();
+        @Override public void save(Ticket t) { store.put(t.getId(), t); }
+        @Override public Optional<Ticket> findById(int id) { return Optional.ofNullable(store.get(id)); }
+        @Override public List<Ticket> findAll() { return new ArrayList<>(store.values()); }
+    }
+
+    // ======================= SERVICE (business logic) =======================
+
+    static class TicketService {
+        private final TicketRepository repo;
+        private final List<String> agents;
+        private int nextId = 1;
+        private int clockHour = 0;
+
+        TicketService(TicketRepository repo, List<String> agents) {
+            this.repo = repo;
+            this.agents = new ArrayList<>(agents);
+        }
+
+        public void advanceClock(int hours) { clockHour += hours; }
+        public int now() { return clockHour; }
+
+        public Ticket create(String type, String title, Priority priority) {
+            Ticket t;
+            switch (type.toLowerCase()) {
+                case "bug":     t = new BugTicket(nextId++, title, priority, clockHour); break;
+                case "feature": t = new FeatureRequest(nextId++, title, priority, clockHour); break;
+                case "access":  t = new AccessRequest(nextId++, title, priority, clockHour); break;
+                default: throw new IllegalArgumentException("Unknown ticket type: " + type);
+            }
+            repo.save(t);
+            return t;
+        }
+
+        public Ticket get(int id) {
+            return repo.findById(id).orElseThrow(() -> new TicketNotFoundException(id));
+        }
+
+        /** Auto-assign to the agent with the fewest active tickets (load balancing). */
+        public void autoAssign(int id) {
+            Ticket t = get(id);
+            Map<String, Long> load = agents.stream().collect(Collectors.toMap(a -> a, a -> 0L));
+            repo.findAll().stream()
+                    .filter(x -> x.getStatus() != Status.CLOSED && x.getStatus() != Status.RESOLVED)
+                    .filter(x -> load.containsKey(x.getAssignee()))
+                    .forEach(x -> load.merge(x.getAssignee(), 1L, Long::sum));
+            String best = Collections.min(load.entrySet(), Map.Entry.comparingByValue()).getKey();
+            t.assignTo(best);
+        }
+
+        public void move(int id, Status next) { get(id).changeStatus(next); }
+
+        /** Escalates every overdue ticket one priority level. Returns how many were escalated. */
+        public int escalateOverdue() {
+            List<Ticket> overdue = repo.findAll().stream()
+                    .filter(t -> t.isOverdue(clockHour))
+                    .collect(Collectors.toList());
+            overdue.forEach(Ticket::escalate);
+            return overdue.size();
+        }
+
+        /** Work queue: highest priority first, then oldest first. */
+        public List<Ticket> workQueue() {
+            return repo.findAll().stream()
+                    .filter(t -> t.getStatus() == Status.OPEN || t.getStatus() == Status.IN_PROGRESS)
+                    .sorted(Comparator.comparing(Ticket::getPriority).reversed()
+                            .thenComparingInt(Ticket::getCreatedAtHour))
+                    .collect(Collectors.toList());
+        }
+
+        public List<Ticket> search(Predicate<Ticket> filter) {
+            return repo.findAll().stream().filter(filter).collect(Collectors.toList());
+        }
+
+        public String report() {
+            List<Ticket> all = repo.findAll();
+            StringBuilder sb = new StringBuilder();
+            sb.append("Total tickets : ").append(all.size()).append("\n");
+
+            Map<Status, Long> byStatus = all.stream()
+                    .collect(Collectors.groupingBy(Ticket::getStatus, TreeMap::new, Collectors.counting()));
+            sb.append("By status     : ").append(byStatus).append("\n");
+
+            Map<String, Long> byCategory = all.stream()
+                    .collect(Collectors.groupingBy(Ticket::category, TreeMap::new, Collectors.counting()));
+            sb.append("By category   : ").append(byCategory).append("\n");
+
+            long overdue = all.stream().filter(t -> t.isOverdue(clockHour)).count();
+            sb.append("Overdue (SLA) : ").append(overdue).append("\n");
+
+            long done = all.stream().filter(t -> t.getStatus() == Status.RESOLVED
+                    || t.getStatus() == Status.CLOSED).count();
+            double rate = all.isEmpty() ? 0 : (done * 100.0) / all.size();
+            sb.append(String.format("Resolution    : %.1f%%", rate));
+            return sb.toString();
+        }
+    }
+
+    // ======================= MINI TEST FRAMEWORK =======================
+
+    static int passed = 0, failed = 0;
+
+    static void check(String name, boolean condition) {
+        if (condition) { passed++; System.out.println("  PASS  " + name); }
+        else           { failed++; System.out.println("  FAIL  " + name); }
+    }
+
+    static boolean throwsException(Class<? extends Exception> type, Runnable action) {
+        try { action.run(); return false; }
+        catch (Exception e) { return type.isInstance(e); }
+    }
+
+    static TicketService newService() {
+        return new TicketService(new InMemoryTicketRepository(), Arrays.asList("Asha", "Ravi", "Meera"));
+    }
+
+    static void runTests() {
+        System.out.println("\n=========== UNIT TESTS ===========");
+
+        TicketService s = newService();
+        Ticket bug = s.create("bug", "Login fails", Priority.HIGH);
+        check("Bug ticket gets stricter SLA (24 - 2 = 22h)", bug.slaHours() == 22);
+
+        Ticket feat = s.create("feature", "Dark mode", Priority.MEDIUM);
+        check("Feature ticket gets relaxed SLA (48 x 2 = 96h)", feat.slaHours() == 96);
+
+        check("New ticket starts OPEN", bug.getStatus() == Status.OPEN);
+
+        s.move(bug.getId(), Status.IN_PROGRESS);
+        check("Valid transition OPEN -> IN_PROGRESS works", bug.getStatus() == Status.IN_PROGRESS);
+
+        check("Invalid transition OPEN -> CLOSED is rejected",
+                throwsException(InvalidTransitionException.class, () -> s.move(feat.getId(), Status.CLOSED)));
+
+        check("Missing ticket id throws TicketNotFoundException",
+                throwsException(TicketNotFoundException.class, () -> s.get(999)));
+
+        check("Unknown ticket type throws IllegalArgumentException",
+                throwsException(IllegalArgumentException.class, () -> s.create("spam", "x", Priority.LOW)));
+
+        s.advanceClock(30);
+        check("Bug (22h SLA) is overdue after 30h", bug.isOverdue(s.now()));
+        check("Feature (96h SLA) is not overdue after 30h", !feat.isOverdue(s.now()));
+
+        int escalated = s.escalateOverdue();
+        check("escalateOverdue() escalates exactly 1 ticket", escalated == 1);
+        check("Overdue HIGH bug becomes CRITICAL", bug.getPriority() == Priority.CRITICAL);
+
+        Ticket crit = s.create("access", "VPN down", Priority.CRITICAL);
+        crit.escalate();
+        check("CRITICAL cannot escalate further", crit.getPriority() == Priority.CRITICAL);
+
+        check("Work queue puts CRITICAL first", s.workQueue().get(0).getPriority() == Priority.CRITICAL);
+
+        TicketService lb = newService();
+        Ticket a = lb.create("bug", "A", Priority.LOW);
+        Ticket b = lb.create("bug", "B", Priority.LOW);
+        lb.autoAssign(a.getId());
+        lb.autoAssign(b.getId());
+        check("Auto-assign spreads load across different agents", !a.getAssignee().equals(b.getAssignee()));
+
+        s.move(bug.getId(), Status.RESOLVED);
+        s.move(bug.getId(), Status.CLOSED);
+        check("CLOSED is a final state",
+                throwsException(InvalidTransitionException.class, () -> s.move(bug.getId(), Status.OPEN)));
+
+        check("History records every change", bug.getHistory().size() >= 5);
+
+        System.out.println("\nResult: " + passed + " passed, " + failed + " failed");
+    }
+
+    // ======================= DEMO =======================
+
+    public static void main(String[] args) {
+        System.out.println("=========== SUPPORT TICKET SYSTEM DEMO ===========\n");
+
+        TicketService service = newService();
+
+        service.create("bug", "Payment page crashes on submit", Priority.CRITICAL);
+        service.create("bug", "Report export shows wrong totals", Priority.HIGH);
+        service.create("feature", "Add CSV export to dashboard", Priority.MEDIUM);
+        service.create("access", "New joiner needs repo access", Priority.LOW);
+        service.create("bug", "Typo on invoice footer", Priority.LOW);
+
+        for (Ticket t : service.search(t -> true)) service.autoAssign(t.getId());
+
+        System.out.println("--- All tickets after auto-assignment ---");
+        service.search(t -> true).forEach(System.out::println);
+
+        service.move(1, Status.IN_PROGRESS);
+        service.move(1, Status.RESOLVED);
+        service.move(2, Status.IN_PROGRESS);
+
+        service.advanceClock(30);
+        int escalated = service.escalateOverdue();
+        System.out.println("\n--- After 30 hours: " + escalated + " overdue ticket(s) escalated ---");
+
+        System.out.println("\n--- Work queue (priority, then oldest) ---");
+        service.workQueue().forEach(System.out::println);
+
+        System.out.println("\n--- Audit trail for ticket #2 ---");
+        service.get(2).getHistory().forEach(h -> System.out.println("  * " + h));
+
+        System.out.println("\n--- Report ---");
+        System.out.println(service.report());
+
+        runTests();
+    }
+}
